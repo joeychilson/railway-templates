@@ -197,6 +197,7 @@ jobs:
           tags: type=raw,value=${{ needs.plan.outputs.version }}
 
       - name: Build image
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -216,8 +217,8 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
 
-      # Same builder and cache as the tested build, so this pushes the image
-      # that just passed the smoke test.
+      # Same builder and cache as the tested build, so every layer should come
+      # from cache and this pushes the image that just passed the smoke test.
       - name: Push image by digest
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -226,6 +227,18 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}
+
+      # A layer rebuilt instead of reused would change the image ID. The
+      # digest is still untagged, so failing here publishes nothing.
+      - name: Check the pushed image is the tested image
+        env:
+          TESTED: ${{ steps.build.outputs.imageid }}
+          PUSHED: ${{ steps.push.outputs.imageid }}
+        run: |
+          if [[ -z "$TESTED" || "$TESTED" != "$PUSHED" ]]; then
+            echo "::error::The pushed image ($PUSHED) is not the image the smoke test ran ($TESTED). Run the release again."
+            exit 1
+          fi
 
       - name: Save digest
         env:
@@ -290,6 +303,12 @@ jobs:
           # still free before any tag moves.
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --silent 2>/dev/null; then
             echo "::error::v$VERSION already exists. Start a new run instead of re-running this one."
+            exit 1
+          fi
+          # X.Y.Z never moves. If a run pushed it and then failed to create the
+          # release, create that release by hand instead of publishing again.
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "::error::$IMAGE:$VERSION is already published. Create the v$VERSION release by hand."
             exit 1
           fi
           args=()
