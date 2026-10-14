@@ -83,9 +83,9 @@ versions it bundles:
 Every push to `main` runs the release workflow. It releases when a file that
 goes into the image changed since the last `vX.Y.Z` tag. Changes to top-level
 Markdown files, `.github/`, `test/`, `examples/`, `renovate.json`,
-`.gitignore`, and `LICENSE` don't release. The version bump is a patch unless a merged PR has the
-`release:minor` or `release:major` label. To release by hand, run the Release
-workflow from the Actions tab and pick a bump.
+`.gitignore`, and `LICENSE` don't release. The version bump is a patch unless a
+merged PR has the `release:minor` or `release:major` label. To release by hand,
+run the Release workflow from the Actions tab and pick a bump.
 
 A release:
 
@@ -99,9 +99,9 @@ A release:
 
 `X.Y.Z` never moves. `X.Y` always points to the newest patch release in that
 line. No release publishes `latest`. Releases run only from `main`, at or after
-the latest tag, so a re-run of an old run can't move `X.Y` backwards. Deployments still use old
-tags, including `latest`, `main`, and `sha-<commit>` tags from before this
-setup, so never delete or move an existing tag.
+the latest tag, so a re-run of an old run can't move `X.Y` backwards.
+Deployments still use old tags, including `latest`, `main`, and `sha-<commit>`
+tags from before this setup, so never delete or move an existing tag.
 
 ## Railway
 
@@ -135,8 +135,9 @@ Every template repo uses the same settings:
 - Squash merging only, with the PR title and description as the commit
   message.
 - Branches deleted after merge, and auto-merge allowed.
-- A `main` ruleset that requires the `ci / lint`, `ci / test (amd64)`, and
-  `ci / test (arm64)` checks.
+- A `main` ruleset that requires a pull request and the `ci / lint`,
+  `ci / test (amd64)`, and `ci / test (arm64)` checks, and blocks force-pushes
+  and deletion. Repo admins can bypass it.
 - The [Renovate app](https://github.com/apps/renovate) installed.
 - `release:minor` and `release:major` labels.
 
