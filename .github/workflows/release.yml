@@ -228,15 +228,17 @@ jobs:
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}
 
-      # A layer rebuilt instead of reused would change the image ID. The
-      # digest is still untagged, so failing here publishes nothing.
+      # The image config lists every layer's digest, so a layer rebuilt instead
+      # of reused changes it. (imageid can't be compared: for the pushed build
+      # it is the manifest list's digest.) The pushed digest is still
+      # untagged, so failing here publishes nothing.
       - name: Check the pushed image is the tested image
         env:
-          TESTED: ${{ steps.build.outputs.imageid }}
-          PUSHED: ${{ steps.push.outputs.imageid }}
+          TESTED: ${{ fromJSON(steps.build.outputs.metadata)['containerimage.config.digest'] }}
+          PUSHED: ${{ fromJSON(steps.push.outputs.metadata)['containerimage.config.digest'] }}
         run: |
           if [[ -z "$TESTED" || "$TESTED" != "$PUSHED" ]]; then
-            echo "::error::The pushed image ($PUSHED) is not the image the smoke test ran ($TESTED). Run the release again."
+            echo "::error::The pushed image config ($PUSHED) is not the one the smoke test ran ($TESTED). Run the release again."
             exit 1
           fi
 
