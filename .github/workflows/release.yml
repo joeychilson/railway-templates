@@ -2,7 +2,7 @@ name: Release
 
 # Called by each template repo's release.yml on every push to main. When the
 # image changed since the last vX.Y.Z tag, it builds and smoke-tests both
-# platforms, pushes the image, then creates the tag and GitHub release. The
+# platforms, pushes X.Y.Z and X.Y, then creates the tag and GitHub release. The
 # release comes last so a release never exists without its image.
 
 on:
@@ -66,6 +66,12 @@ jobs:
           previous="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
           if [[ -z "$previous" ]]; then
             echo "::error::No vX.Y.Z tag exists yet. Tag the first release by hand."
+            exit 1
+          fi
+          # A re-run of an old run, or a dispatch from another branch, would
+          # otherwise publish older code over the X.Y tag.
+          if [[ "$GITHUB_REF" != refs/heads/main ]] || ! git merge-base --is-ancestor "$previous" HEAD; then
+            echo "::error::Releases run only from main at or after $previous."
             exit 1
           fi
 
@@ -271,15 +277,21 @@ jobs:
           tags: |
             type=semver,pattern={{version}},value=${{ needs.plan.outputs.version }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.plan.outputs.version }}
-            type=sha
 
       - name: Push tags
         working-directory: ${{ runner.temp }}/digests
         env:
+          GH_TOKEN: ${{ github.token }}
           METADATA: ${{ steps.meta.outputs.json }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
+          # "Re-run failed jobs" reuses an old plan, so check the version is
+          # still free before any tag moves.
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --silent 2>/dev/null; then
+            echo "::error::v$VERSION already exists. Start a new run instead of re-running this one."
+            exit 1
+          fi
           args=()
           while read -r tag; do args+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$METADATA")
           while read -r annotation; do args+=(--annotation "$annotation"); done < <(jq -r '.annotations[]' <<< "$METADATA")

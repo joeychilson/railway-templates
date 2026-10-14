@@ -33,7 +33,7 @@
       "commitMessageExtra": "digest to {{newDigestShort}}"
     },
     {
-      "description": "Docker registries don't report when a tag was pushed, so image updates can't wait out a release age",
+      "description": "Renovate gets no push dates from Docker Hub or GHCR, and a required age would hold image updates forever",
       "matchDatasources": ["docker"],
       "minimumReleaseAge": null
     },

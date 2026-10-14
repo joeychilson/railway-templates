@@ -58,8 +58,9 @@ a YAML file.
 [Renovate](https://docs.renovatebot.com) runs every few hours on each repo,
 using [`default.json`](default.json):
 
-- It waits until an npm or GitHub release is 2 days old. Docker registries
-  don't report push dates, so image updates don't wait.
+- It waits until an npm or GitHub release is 2 days old. Image updates from
+  Docker Hub and GHCR don't wait, because Renovate gets no push dates for
+  them.
 - It merges patch, minor, and digest updates once CI passes.
 - It leaves major updates, and minor updates of 0.x versions, open for review.
   The repo's Dependency Dashboard issue lists them.
@@ -81,8 +82,8 @@ versions it bundles:
 
 Every push to `main` runs the release workflow. It releases when a file that
 goes into the image changed since the last `vX.Y.Z` tag. Changes to top-level
-Markdown files, `.github/`, `test/`, `examples/`, and `renovate.json` don't
-release. The version bump is a patch unless a merged PR has the
+Markdown files, `.github/`, `test/`, `examples/`, `renovate.json`,
+`.gitignore`, and `LICENSE` don't release. The version bump is a patch unless a merged PR has the
 `release:minor` or `release:major` label. To release by hand, run the Release
 workflow from the Actions tab and pick a bump.
 
@@ -90,13 +91,15 @@ A release:
 
 1. Builds the image on amd64 and arm64 runners and runs the smoke test on
    each.
-2. Pushes it to GHCR as `X.Y.Z`, `X.Y`, and `sha-<commit>`.
+2. Checks that the version is unused, then pushes the image to GHCR as
+   `X.Y.Z` and `X.Y`.
 3. Creates the `vX.Y.Z` tag and a GitHub release titled
    `vX.Y.Z — Component version, Component version`, with sections for changes,
    versions, and the image.
 
-`X.Y.Z` and `sha-<commit>` never move. `X.Y` always points to the newest patch
-release in that line. No release publishes `latest`. Deployments still use old
+`X.Y.Z` never moves. `X.Y` always points to the newest patch release in that
+line. No release publishes `latest`. Releases run only from `main`, at or after
+the latest tag, so a re-run of an old run can't move `X.Y` backwards. Deployments still use old
 tags, including `latest`, `main`, and `sha-<commit>` tags from before this
 setup, so never delete or move an existing tag.
 
