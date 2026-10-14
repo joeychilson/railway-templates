@@ -111,12 +111,17 @@ minor or major release, change the template's image tag to the new `X.Y` in
 the template editor once the release has published, and add upgrade steps to
 the release notes.
 
-The service settings (image, variables, healthcheck, auto-updates) can only be
-changed in the template editor on railway.com. The overview comes from each
-repo's `TEMPLATE.md`:
+The service settings (image, variables, healthcheck, auto-updates) and the
+template name can only be changed in the template editor on railway.com. The
+overview comes from each repo's `TEMPLATE.md`, and the CLI updates it together
+with the category, the description (75 characters at most), and the card image:
 
 ```text
-railway templates update <template-code> --readme-file TEMPLATE.md
+railway templates update <template-code> \
+  --category <category> \
+  --description "<description>" \
+  --readme-file TEMPLATE.md \
+  --image https://raw.githubusercontent.com/joeychilson/railway-templates/main/icons/<name>.svg
 ```
 
 Every template should have:
