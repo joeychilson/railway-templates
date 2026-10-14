@@ -1,0 +1,28 @@
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint workflows
+        env:
+          # renovate: datasource=docker packageName=rhysd/actionlint depName=actionlint
+          ACTIONLINT_VERSION: 1.7.12
+        run: docker run --rm -v "$PWD:/repo" -w /repo "rhysd/actionlint:$ACTIONLINT_VERSION" -color
+
+      - name: Validate Renovate config
+        run: npx --yes --package renovate -- renovate-config-validator --strict --no-global default.json renovate.json

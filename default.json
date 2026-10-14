@@ -1,0 +1,63 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Shared Renovate preset for the Railway template repos. See README.md.",
+  "extends": ["config:recommended", ":semanticCommitsDisabled"],
+  "labels": ["dependencies"],
+  "minimumReleaseAge": "2 days",
+  "dockerfile": {
+    "description": "Base images are pinned through `# renovate:` ARGs instead. The built-in manager would report them twice.",
+    "enabled": false
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Version pins marked with a `# renovate:` comment on the line above an ARG or a YAML key",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/", "/\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) packageName=(?<packageName>\\S+) depName=(?<depName>\\S+)(?: depType=(?<depType>\\S+))?(?: versioning=(?<versioning>\\S+))?(?: extractVersion=(?<extractVersion>\\S+))?\\s+(?:ARG \\w+=|\\w+: )(?<currentValue>[^@\\s]+)(?:@(?<currentDigest>sha256:[0-9a-f]{64}))?"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Name updates after the component, for example \"Bump OpenCode to 2.0.29\"",
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "commitMessageAction": "Bump",
+      "commitMessageTopic": "{{depName}}",
+      "commitMessageExtra": "to {{newValue}}"
+    },
+    {
+      "matchUpdateTypes": ["digest"],
+      "commitMessageAction": "Bump",
+      "commitMessageTopic": "{{depName}} {{currentValue}}",
+      "commitMessageExtra": "digest to {{newDigestShort}}"
+    },
+    {
+      "description": "Docker registries don't report when a tag was pushed, so image updates can't wait out a release age",
+      "matchDatasources": ["docker"],
+      "minimumReleaseAge": null
+    },
+    {
+      "description": "Merge compatible updates once CI passes",
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "automerge": true
+    },
+    {
+      "description": "A 0.x minor update can break compatibility, so it waits for review",
+      "matchCurrentVersion": "/^v?0\\./",
+      "matchUpdateTypes": ["minor"],
+      "automerge": false
+    },
+    {
+      "description": "A PostgreSQL major upgrade needs a dump and restore of every database",
+      "matchDepNames": ["PostgreSQL"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "Template repos call the shared workflows on main",
+      "matchPackageNames": ["joeychilson/railway-templates"],
+      "enabled": false
+    }
+  ]
+}

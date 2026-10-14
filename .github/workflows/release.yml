@@ -1,0 +1,301 @@
+name: Release
+
+# Called by each template repo's release.yml on every push to main. When the
+# image changed since the last vX.Y.Z tag, it builds and smoke-tests both
+# platforms, pushes the image, then creates the tag and GitHub release. The
+# release comes last so a release never exists without its image.
+
+on:
+  workflow_call:
+    inputs:
+      bump:
+        description: auto releases a patch (or the bump a PR label asks for) only when the image changed; patch, minor, and major always release.
+        type: string
+        default: auto
+      extra-images:
+        description: Other GHCR image names, one per line, that receive the same tags.
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # Paths that are not part of the image. Changes to anything else release.
+  # With glob magic, *.md matches only top-level files, so Markdown copied
+  # into an image from a subdirectory still counts.
+  IMAGE_PATHS: >-
+    .
+    :(exclude,glob)*.md
+    :(exclude).github
+    :(exclude)examples
+    :(exclude)test
+    :(exclude).gitignore
+    :(exclude)LICENSE
+    :(exclude)renovate.json
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      title: ${{ steps.plan.outputs.title }}
+      notes: ${{ steps.plan.outputs.notes }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Plan release
+        id: plan
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXTRA_IMAGES: ${{ inputs.extra-images }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          read -ra image_paths <<< "$IMAGE_PATHS"
+
+          previous="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+          if [[ -z "$previous" ]]; then
+            echo "::error::No vX.Y.Z tag exists yet. Tag the first release by hand."
+            exit 1
+          fi
+
+          bump="$BUMP"
+          if [[ "$bump" == auto ]]; then
+            if git diff --quiet "$previous" HEAD -- "${image_paths[@]}"; then
+              echo "The image hasn't changed since $previous."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            bump="patch"
+            for sha in $(git rev-list "$previous..HEAD"); do
+              labels="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq '.[].labels[].name')"
+              if grep -qx 'release:major' <<< "$labels"; then
+                bump="major"
+              elif grep -qx 'release:minor' <<< "$labels" && [[ "$bump" == patch ]]; then
+                bump="minor"
+              fi
+            done
+          fi
+
+          IFS=. read -r major minor patch <<< "${previous#v}"
+          case "$bump" in
+            major) version="$((major + 1)).0.0" ;;
+            minor) version="$major.$((minor + 1)).0" ;;
+            patch) version="$major.$minor.$((patch + 1))" ;;
+            *) echo "::error::bump must be auto, patch, minor, or major, not '$bump'."; exit 1 ;;
+          esac
+
+          # One "name<TAB>version<TAB>depType" line per `# renovate:` pin in
+          # the Dockerfile, in file order. depType=tool pins are listed in
+          # the notes but left out of the title.
+          components="$(awk '
+            /^# renovate: / {
+              name = ""; type = ""
+              for (i = 3; i <= NF; i++) {
+                if ($i ~ /^depName=/) name = substr($i, 9)
+                if ($i ~ /^depType=/) type = substr($i, 9)
+              }
+              next
+            }
+            name != "" && /^ARG [A-Za-z0-9_]+=/ {
+              value = $0
+              sub(/^ARG [^=]+=/, "", value)
+              sub(/@sha256:.*/, "", value)
+              print name "\t" value "\t" type
+              name = ""
+            }
+          ' Dockerfile)"
+          if [[ -z "$components" ]]; then
+            echo "::error::The Dockerfile has no '# renovate:' version pins."
+            exit 1
+          fi
+          summary="$(awk -F'\t' '$3 != "tool" { printf "%s%s %s", sep, $1, $2; sep = ", " }' <<< "$components")"
+
+          changes="$(git log --reverse --format='- %s' "$previous..HEAD" -- "${image_paths[@]}")"
+          {
+            echo "## Changes"
+            echo
+            echo "${changes:-"- Rebuild with no source changes."}"
+            echo
+            echo "## Versions"
+            echo
+            echo "| Component | Version |"
+            echo "| --- | --- |"
+            awk -F'\t' '{ print "| " $1 " | " $2 " |" }' <<< "$components"
+            echo
+            echo "## Image"
+            echo
+            echo "\`$IMAGE:$version\`"
+            for extra in $EXTRA_IMAGES; do
+              echo
+              echo "Also published as \`$extra:$version\` for deployments that use the old name."
+            done
+            echo
+            echo "The \`${version%.*}\` tag now points to this release."
+            echo
+            echo "**Full changelog**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$previous...v$version"
+          } > "$RUNNER_TEMP/notes.md"
+
+          delimiter="notes-$RANDOM$RANDOM"
+          {
+            echo "release=true"
+            echo "version=$version"
+            echo "title=v$version — $summary"
+            echo "notes<<$delimiter"
+            cat "$RUNNER_TEMP/notes.md"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### v$version — $summary"
+            echo
+            cat "$RUNNER_TEMP/notes.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    name: build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Generate image labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: type=raw,value=${{ needs.plan.outputs.version }}
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: ${{ github.event.repository.name }}:test
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+
+      - name: Run smoke test
+        run: ./test/smoke-test.sh "${{ github.event.repository.name }}:test"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      # Same builder and cache as the tested build, so this pushes the image
+      # that just passed the smoke test.
+      - name: Push image by digest
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+
+      - name: Save digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Generate image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: |
+            ${{ env.IMAGE }}
+            ${{ inputs.extra-images }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.plan.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.plan.outputs.version }}
+            type=sha
+
+      - name: Push tags
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          METADATA: ${{ steps.meta.outputs.json }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          args=()
+          while read -r tag; do args+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$METADATA")
+          while read -r annotation; do args+=(--annotation "$annotation"); done < <(jq -r '.annotations[]' <<< "$METADATA")
+          for digest in *; do args+=("$IMAGE@sha256:$digest"); done
+          docker buildx imagetools create "${args[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          TITLE: ${{ needs.plan.outputs.title }}
+          NOTES: ${{ needs.plan.outputs.notes }}
+        run: |
+          gh release create "v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes "$NOTES"
