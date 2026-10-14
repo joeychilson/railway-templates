@@ -20,7 +20,7 @@ jobs:
           persist-credentials: false
 
       - name: Check shell scripts
-        run: git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck
+        run: git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck -x
 
   test:
     name: test (${{ matrix.arch }})
