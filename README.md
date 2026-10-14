@@ -121,7 +121,9 @@ railway templates update <template-code> --readme-file TEMPLATE.md
 
 Every template should have:
 
-- A 1:1 icon with a transparent background on the template and each service.
+- A 1:1 icon on the template and each service. [`icons/`](icons) holds them,
+  and the templates load them from
+  `https://raw.githubusercontent.com/joeychilson/railway-templates/main/icons/<name>.svg`.
 - A description on every variable.
 - A healthcheck path when the service has one.
 - A volume for any state that must survive a redeploy.
