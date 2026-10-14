@@ -46,7 +46,13 @@
       "description": "A 0.x minor update can break compatibility, so it waits for review",
       "matchCurrentVersion": "/^v?0\\./",
       "matchUpdateTypes": ["minor"],
-      "automerge": false
+      "automerge": false,
+      "addLabels": ["release:major"]
+    },
+    {
+      "description": "Held updates release as a new major by default, so merging one never rolls out to existing deployments. Relabel the PR if the update is compatible.",
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["release:major"]
     },
     {
       "description": "A PostgreSQL major upgrade needs a dump and restore of every database",

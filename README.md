@@ -62,13 +62,20 @@ using [`default.json`](default.json):
   Docker Hub and GHCR don't wait, because Renovate gets no push dates for
   them.
 - It merges patch, minor, and digest updates once CI passes.
-- It leaves major updates, and minor updates of 0.x versions, open for review.
-  The repo's Dependency Dashboard issue lists them.
+- It leaves major updates, and minor updates of 0.x versions, open for review,
+  with the `release:major` label. Merged as they are, they start a new `X.Y`,
+  so they never roll out to existing deployments by themselves. Change the
+  label to `release:minor`, or remove it, when an update is compatible. The
+  repo's Dependency Dashboard issue lists everything Renovate is holding.
 - It never proposes a PostgreSQL major upgrade, because existing databases
   need a dump and restore.
 
 PR titles name the component and the new version, such as "Bump OpenCode to
 2.0.29".
+
+In this repo, GitHub Actions minor updates also wait for review, because every
+template's CI and releases run these workflows and nothing here can test a
+release.
 
 ## Releases
 
@@ -91,8 +98,8 @@ A release:
 
 1. Builds the image on amd64 and arm64 runners and runs the smoke test on
    each.
-2. Checks that the version is unused, then pushes the image to GHCR as
-   `X.Y.Z` and `X.Y`.
+2. Checks that the pushed image is the one the smoke test ran and that the
+   version is unused, then tags it on GHCR as `X.Y.Z` and `X.Y`.
 3. Creates the `vX.Y.Z` tag and a GitHub release titled
    `vX.Y.Z — Component version, Component version`, with sections for changes,
    versions, and the image.

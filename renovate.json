@@ -1,4 +1,12 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>joeychilson/railway-templates", "helpers:pinGitHubActionDigests"]
+  "extends": ["github>joeychilson/railway-templates", "helpers:pinGitHubActionDigests"],
+  "packageRules": [
+    {
+      "description": "Every template's CI and releases run these workflows, and this repo can't test a release, so action minor updates wait for review",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor"],
+      "automerge": false
+    }
+  ]
 }
