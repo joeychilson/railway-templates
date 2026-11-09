@@ -3,7 +3,8 @@ name: Release
 # Called by each template repo's release.yml on every push to main. When the
 # image changed since the last vX.Y.Z tag, it builds and smoke-tests both
 # platforms, pushes X.Y.Z and X.Y, then creates the tag and GitHub release. The
-# release comes last so a release never exists without its image.
+# release comes last so a release never exists without its image; if creating
+# it fails, the next run creates it before planning a new version.
 
 on:
   workflow_call:
@@ -63,6 +64,63 @@ jobs:
           set -euo pipefail
           read -ra image_paths <<< "$IMAGE_PATHS"
 
+          # Sets $title and writes $RUNNER_TEMP/notes.md for the image built
+          # from commit $2 and released as version $3 after tag $1.
+          write_notes() {
+            local previous="$1" commit="$2" version="$3" components summary changes extra
+            # One "name<TAB>version<TAB>depType" line per `# renovate:` pin in
+            # the Dockerfile, in file order. depType=tool pins are listed in
+            # the notes but left out of the title.
+            components="$(git show "$commit:Dockerfile" | awk '
+              /^# renovate: / {
+                name = ""; type = ""
+                for (i = 3; i <= NF; i++) {
+                  if ($i ~ /^depName=/) name = substr($i, 9)
+                  if ($i ~ /^depType=/) type = substr($i, 9)
+                }
+                next
+              }
+              name != "" && /^ARG [A-Za-z0-9_]+=/ {
+                value = $0
+                sub(/^ARG [^=]+=/, "", value)
+                sub(/@sha256:.*/, "", value)
+                print name "\t" value "\t" type
+                name = ""
+              }
+            ')"
+            if [[ -z "$components" ]]; then
+              echo "::error::The Dockerfile has no '# renovate:' version pins."
+              exit 1
+            fi
+            summary="$(awk -F'\t' '$3 != "tool" { printf "%s%s %s", sep, $1, $2; sep = ", " }' <<< "$components")"
+            title="v$version — $summary"
+
+            changes="$(git log --reverse --format='- %s' "$previous..$commit" -- "${image_paths[@]}")"
+            {
+              echo "## Changes"
+              echo
+              echo "${changes:-"- Rebuild with no source changes."}"
+              echo
+              echo "## Versions"
+              echo
+              echo "| Component | Version |"
+              echo "| --- | --- |"
+              awk -F'\t' '{ print "| " $1 " | " $2 " |" }' <<< "$components"
+              echo
+              echo "## Image"
+              echo
+              echo "\`$IMAGE:$version\`"
+              for extra in $EXTRA_IMAGES; do
+                echo
+                echo "Also published as \`$extra:$version\` for deployments that use the old name."
+              done
+              echo
+              echo "The \`${version%.*}\` tag now points to this release."
+              echo
+              echo "**Full changelog**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$previous...v$version"
+            } > "$RUNNER_TEMP/notes.md"
+          }
+
           previous="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
           if [[ -z "$previous" ]]; then
             echo "::error::No vX.Y.Z tag exists yet. Tag the first release by hand."
@@ -75,94 +133,69 @@ jobs:
             exit 1
           fi
 
-          bump="$BUMP"
-          if [[ "$bump" == auto ]]; then
-            if git diff --quiet "$previous" HEAD -- "${image_paths[@]}"; then
-              echo "The image hasn't changed since $previous."
+          while :; do
+            bump="$BUMP"
+            if [[ "$bump" == auto ]]; then
+              if git diff --quiet "$previous" HEAD -- "${image_paths[@]}"; then
+                echo "The image hasn't changed since $previous."
+                echo "release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              bump="patch"
+              for sha in $(git rev-list "$previous..HEAD"); do
+                labels="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq '.[].labels[].name')"
+                if grep -qx 'release:major' <<< "$labels"; then
+                  bump="major"
+                elif grep -qx 'release:minor' <<< "$labels" && [[ "$bump" == patch ]]; then
+                  bump="minor"
+                fi
+              done
+            fi
+
+            IFS=. read -r major minor patch <<< "${previous#v}"
+            case "$bump" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="$major.$((minor + 1)).0" ;;
+              patch) version="$major.$minor.$((patch + 1))" ;;
+              *) echo "::error::bump must be auto, patch, minor, or major, not '$bump'."; exit 1 ;;
+            esac
+
+            # A run that pushed X.Y.Z but then failed to create its release
+            # leaves the image without a tag, and every later run would plan
+            # the same version. Release that image for the commit it was built
+            # from, then plan again after it.
+            revision="$( (docker buildx imagetools inspect --raw "$IMAGE:$version" 2>/dev/null || true) \
+              | jq -r '.annotations["org.opencontainers.image.revision"] // empty')"
+            if [[ -z "$revision" ]]; then
+              break
+            fi
+            if ! git merge-base --is-ancestor "$revision" HEAD; then
+              echo "::error::$IMAGE:$version was built from $revision, which isn't on main. Release it by hand."
+              exit 1
+            fi
+            write_notes "$previous" "$revision" "$version"
+            gh release create "v$version" --target "$revision" --title "$title" --notes-file "$RUNNER_TEMP/notes.md"
+            echo "::warning::Created the missing v$version release for $IMAGE:$version, built from $revision."
+            if [[ "$revision" == "$(git rev-parse HEAD)" ]]; then
               echo "release=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            bump="patch"
-            for sha in $(git rev-list "$previous..HEAD"); do
-              labels="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq '.[].labels[].name')"
-              if grep -qx 'release:major' <<< "$labels"; then
-                bump="major"
-              elif grep -qx 'release:minor' <<< "$labels" && [[ "$bump" == patch ]]; then
-                bump="minor"
-              fi
-            done
-          fi
+            git tag "v$version" "$revision"
+            previous="v$version"
+          done
 
-          IFS=. read -r major minor patch <<< "${previous#v}"
-          case "$bump" in
-            major) version="$((major + 1)).0.0" ;;
-            minor) version="$major.$((minor + 1)).0" ;;
-            patch) version="$major.$minor.$((patch + 1))" ;;
-            *) echo "::error::bump must be auto, patch, minor, or major, not '$bump'."; exit 1 ;;
-          esac
-
-          # One "name<TAB>version<TAB>depType" line per `# renovate:` pin in
-          # the Dockerfile, in file order. depType=tool pins are listed in
-          # the notes but left out of the title.
-          components="$(awk '
-            /^# renovate: / {
-              name = ""; type = ""
-              for (i = 3; i <= NF; i++) {
-                if ($i ~ /^depName=/) name = substr($i, 9)
-                if ($i ~ /^depType=/) type = substr($i, 9)
-              }
-              next
-            }
-            name != "" && /^ARG [A-Za-z0-9_]+=/ {
-              value = $0
-              sub(/^ARG [^=]+=/, "", value)
-              sub(/@sha256:.*/, "", value)
-              print name "\t" value "\t" type
-              name = ""
-            }
-          ' Dockerfile)"
-          if [[ -z "$components" ]]; then
-            echo "::error::The Dockerfile has no '# renovate:' version pins."
-            exit 1
-          fi
-          summary="$(awk -F'\t' '$3 != "tool" { printf "%s%s %s", sep, $1, $2; sep = ", " }' <<< "$components")"
-
-          changes="$(git log --reverse --format='- %s' "$previous..HEAD" -- "${image_paths[@]}")"
-          {
-            echo "## Changes"
-            echo
-            echo "${changes:-"- Rebuild with no source changes."}"
-            echo
-            echo "## Versions"
-            echo
-            echo "| Component | Version |"
-            echo "| --- | --- |"
-            awk -F'\t' '{ print "| " $1 " | " $2 " |" }' <<< "$components"
-            echo
-            echo "## Image"
-            echo
-            echo "\`$IMAGE:$version\`"
-            for extra in $EXTRA_IMAGES; do
-              echo
-              echo "Also published as \`$extra:$version\` for deployments that use the old name."
-            done
-            echo
-            echo "The \`${version%.*}\` tag now points to this release."
-            echo
-            echo "**Full changelog**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$previous...v$version"
-          } > "$RUNNER_TEMP/notes.md"
-
+          write_notes "$previous" HEAD "$version"
           delimiter="notes-$RANDOM$RANDOM"
           {
             echo "release=true"
             echo "version=$version"
-            echo "title=v$version — $summary"
+            echo "title=$title"
             echo "notes<<$delimiter"
             cat "$RUNNER_TEMP/notes.md"
             echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
           {
-            echo "### v$version — $summary"
+            echo "### $title"
             echo
             cat "$RUNNER_TEMP/notes.md"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -309,10 +342,17 @@ jobs:
             echo "::error::v$VERSION already exists. Start a new run instead of re-running this one."
             exit 1
           fi
-          # X.Y.Z never moves. If a run pushed it and then failed to create the
-          # release, create that release by hand instead of publishing again.
+          # X.Y.Z never moves. An earlier attempt of this run may have pushed
+          # it before failing to create the release; then only the release is
+          # left to do.
+          revision="$( (docker buildx imagetools inspect --raw "$IMAGE:$VERSION" 2>/dev/null || true) \
+            | jq -r '.annotations["org.opencontainers.image.revision"] // empty')"
+          if [[ "$revision" == "$GITHUB_SHA" ]]; then
+            echo "$IMAGE:$VERSION is already published from this commit."
+            exit 0
+          fi
           if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
-            echo "::error::$IMAGE:$VERSION is already published. Create the v$VERSION release by hand."
+            echo "::error::$IMAGE:$VERSION is already published from ${revision:-another commit}. Start a new run; it releases that image first."
             exit 1
           fi
           args=()
@@ -322,6 +362,8 @@ jobs:
           docker buildx imagetools create "${args[@]}"
           docker buildx imagetools inspect "$IMAGE:$VERSION"
 
+      # GitHub sometimes answers 500 here, sometimes after creating the
+      # release. If every attempt fails, the next run's plan creates it.
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -329,8 +371,18 @@ jobs:
           TITLE: ${{ needs.plan.outputs.title }}
           NOTES: ${{ needs.plan.outputs.notes }}
         run: |
-          gh release create "v$VERSION" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "$TITLE" \
-            --notes "$NOTES"
+          for attempt in 1 2 3 4 5; do
+            if gh release create "v$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes "$NOTES"; then
+              exit 0
+            fi
+            if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep $((attempt * 15))
+          done
+          echo "::error::Couldn't create the v$VERSION release. The next release run creates it."
+          exit 1
