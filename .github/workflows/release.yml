@@ -3,7 +3,8 @@ name: Release
 # Called by each template repo's release.yml on every push to main. When the
 # image changed since the last vX.Y.Z tag, it builds and smoke-tests both
 # platforms, pushes X.Y.Z and X.Y, then creates the tag and GitHub release. The
-# release comes last so a release never exists without its image.
+# release comes last so a release never exists without its image; if creating
+# it fails, the next run creates it before planning a new version.
 
 on:
   workflow_call:
@@ -63,6 +64,126 @@ jobs:
           set -euo pipefail
           read -ra image_paths <<< "$IMAGE_PATHS"
 
+          # Sets $title and writes $RUNNER_TEMP/notes.md for the image built
+          # from commit $2 and released as version $3 after tag $1.
+          write_notes() {
+            local previous="$1" commit="$2" version="$3" components summary changes extra
+            # One "name<TAB>version<TAB>depType" line per `# renovate:` pin in
+            # the Dockerfile, in file order. depType=tool pins are listed in
+            # the notes but left out of the title.
+            components="$(git show "$commit:Dockerfile" | awk '
+              /^# renovate: / {
+                name = ""; type = ""
+                for (i = 3; i <= NF; i++) {
+                  if ($i ~ /^depName=/) name = substr($i, 9)
+                  if ($i ~ /^depType=/) type = substr($i, 9)
+                }
+                next
+              }
+              name != "" && /^ARG [A-Za-z0-9_]+=/ {
+                value = $0
+                sub(/^ARG [^=]+=/, "", value)
+                sub(/@sha256:.*/, "", value)
+                print name "\t" value "\t" type
+                name = ""
+              }
+            ')"
+            if [[ -z "$components" ]]; then
+              echo "::error::The Dockerfile has no '# renovate:' version pins."
+              exit 1
+            fi
+            summary="$(awk -F'\t' '$3 != "tool" { printf "%s%s %s", sep, $1, $2; sep = ", " }' <<< "$components")"
+            title="v$version — $summary"
+
+            changes="$(git log --reverse --format='- %s' "$previous..$commit" -- "${image_paths[@]}")"
+            {
+              echo "## Changes"
+              echo
+              echo "${changes:-"- Rebuild with no source changes."}"
+              echo
+              echo "## Versions"
+              echo
+              echo "| Component | Version |"
+              echo "| --- | --- |"
+              awk -F'\t' '{ print "| " $1 " | " $2 " |" }' <<< "$components"
+              echo
+              echo "## Image"
+              echo
+              echo "\`$IMAGE:$version\`"
+              for extra in $EXTRA_IMAGES; do
+                echo
+                echo "Also published as \`$extra:$version\` for deployments that use the old name."
+              done
+              echo
+              echo "The \`${version%.*}\` tag now points to this release."
+              echo
+              echo "**Full changelog**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$previous...v$version"
+            } > "$RUNNER_TEMP/notes.md"
+          }
+
+          # Fetches the manifest of public image $1 (name:tag) into
+          # $RUNNER_TEMP/manifest.json and sets $manifest_digest. Returns 1 when the
+          # tag doesn't exist and stops on any other answer, so a registry error is
+          # never mistaken for a missing tag.
+          fetch_manifest() {
+            local ref="${1#ghcr.io/}" token code
+            token="$(curl -fsS --retry 3 "https://ghcr.io/token?scope=repository:${ref%:*}:pull" | jq -r .token)"
+            code="$(curl -sS --retry 3 -o "$RUNNER_TEMP/manifest.json" -D "$RUNNER_TEMP/headers.txt" -w '%{http_code}' \
+              -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+              "https://ghcr.io/v2/${ref%:*}/manifests/${ref##*:}")" || true
+            case "$code" in
+              200) manifest_digest="$(tr -d '\r' < "$RUNNER_TEMP/headers.txt" | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }')" ;;
+              404) return 1 ;;
+              *) echo "::error::GHCR answered HTTP $code for $1."; exit 1 ;;
+            esac
+          }
+
+          # Points the X.Y.Z and X.Y tags of version $1, in every image name, at
+          # the index $2 (name@digest). An existing X.Y.Z never moves, and X.Y
+          # never moves back.
+          ensure_tags() {
+            local version="$1" source="$2" image tag current
+            for image in $IMAGE $EXTRA_IMAGES; do
+              for tag in "$version" "${version%.*}"; do
+                if fetch_manifest "$image:$tag"; then
+                  if [[ "$manifest_digest" == "${source##*@}" ]]; then
+                    continue
+                  fi
+                  if [[ "$tag" == "$version" ]]; then
+                    echo "::error::$image:$tag is already a different image ($manifest_digest), and X.Y.Z tags never move."
+                    exit 1
+                  fi
+                  current="$(jq -r '.annotations["org.opencontainers.image.version"] // empty' "$RUNNER_TEMP/manifest.json")"
+                  if [[ -n "$current" && "$(printf '%s\n' "$current" "$version" | sort -V | tail -n 1)" != "$version" ]]; then
+                    echo "::error::$image:$tag points to $current, which is newer than $version."
+                    exit 1
+                  fi
+                fi
+                docker buildx imagetools create -t "$image:$tag" "$source"
+              done
+            done
+          }
+
+          # GitHub sometimes answers 500, sometimes after creating the release, so
+          # retry and count a release that exists afterwards as created.
+          create_release() {
+            local version="$1" target="$2" title="$3" notes="$4" attempt
+            for attempt in 1 2 3 4 5; do
+              if gh release create "v$version" --repo "$GITHUB_REPOSITORY" --target "$target" --title "$title" --notes-file "$notes"; then
+                return 0
+              fi
+              if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                return 0
+              fi
+              if (( attempt < 5 )); then
+                sleep $((attempt * 15))
+              fi
+            done
+            echo "::error::Couldn't create the v$version release. The next release run creates it."
+            exit 1
+          }
+
           previous="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
           if [[ -z "$previous" ]]; then
             echo "::error::No vX.Y.Z tag exists yet. Tag the first release by hand."
@@ -75,94 +196,83 @@ jobs:
             exit 1
           fi
 
-          bump="$BUMP"
-          if [[ "$bump" == auto ]]; then
-            if git diff --quiet "$previous" HEAD -- "${image_paths[@]}"; then
-              echo "The image hasn't changed since $previous."
-              echo "release=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            bump="patch"
-            for sha in $(git rev-list "$previous..HEAD"); do
-              labels="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq '.[].labels[].name')"
-              if grep -qx 'release:major' <<< "$labels"; then
-                bump="major"
-              elif grep -qx 'release:minor' <<< "$labels" && [[ "$bump" == patch ]]; then
-                bump="minor"
+          while :; do
+            IFS=. read -r major minor patch <<< "${previous#v}"
+
+            # A run that pushed an image and then failed to create its
+            # release leaves that version without a tag, so every later run
+            # would plan it again. Finish that release for the commit the
+            # image was built from, then plan again after it.
+            orphan=""
+            for candidate in "$major.$minor.$((patch + 1))" "$major.$((minor + 1)).0" "$((major + 1)).0.0"; do
+              for name in $IMAGE $EXTRA_IMAGES; do
+                if fetch_manifest "$name:$candidate"; then
+                  orphan="$candidate"
+                  source="$name@$manifest_digest"
+                  revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' "$RUNNER_TEMP/manifest.json")"
+                  break 2
+                fi
+              done
+            done
+            if [[ -n "$orphan" ]]; then
+              if [[ -z "$revision" ]] \
+                || ! git merge-base --is-ancestor "$previous" "$revision" 2>/dev/null \
+                || ! git merge-base --is-ancestor "$revision" HEAD 2>/dev/null; then
+                echo "::error::${source%@*}:$orphan has no release and wasn't built from a commit between $previous and HEAD. Release it by hand."
+                exit 1
               fi
-            done
-          fi
+              docker login ghcr.io -u "$GITHUB_REPOSITORY_OWNER" --password-stdin <<< "$GH_TOKEN"
+              ensure_tags "$orphan" "$source"
+              write_notes "$previous" "$revision" "$orphan"
+              create_release "$orphan" "$revision" "$title" "$RUNNER_TEMP/notes.md"
+              echo "::warning::Created the missing v$orphan release for $IMAGE:$orphan, built from $revision."
+              git tag "v$orphan" "$revision"
+              previous="v$orphan"
+              if [[ "$revision" == "$(git rev-parse HEAD)" ]]; then
+                echo "release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              continue
+            fi
 
-          IFS=. read -r major minor patch <<< "${previous#v}"
-          case "$bump" in
-            major) version="$((major + 1)).0.0" ;;
-            minor) version="$major.$((minor + 1)).0" ;;
-            patch) version="$major.$minor.$((patch + 1))" ;;
-            *) echo "::error::bump must be auto, patch, minor, or major, not '$bump'."; exit 1 ;;
-          esac
+            bump="$BUMP"
+            if [[ "$bump" == auto ]]; then
+              if git diff --quiet "$previous" HEAD -- "${image_paths[@]}"; then
+                echo "The image hasn't changed since $previous."
+                echo "release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              bump="patch"
+              for sha in $(git rev-list "$previous..HEAD"); do
+                labels="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq '.[].labels[].name')"
+                if grep -qx 'release:major' <<< "$labels"; then
+                  bump="major"
+                elif grep -qx 'release:minor' <<< "$labels" && [[ "$bump" == patch ]]; then
+                  bump="minor"
+                fi
+              done
+            fi
+            case "$bump" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="$major.$((minor + 1)).0" ;;
+              patch) version="$major.$minor.$((patch + 1))" ;;
+              *) echo "::error::bump must be auto, patch, minor, or major, not '$bump'."; exit 1 ;;
+            esac
+            break
+          done
 
-          # One "name<TAB>version<TAB>depType" line per `# renovate:` pin in
-          # the Dockerfile, in file order. depType=tool pins are listed in
-          # the notes but left out of the title.
-          components="$(awk '
-            /^# renovate: / {
-              name = ""; type = ""
-              for (i = 3; i <= NF; i++) {
-                if ($i ~ /^depName=/) name = substr($i, 9)
-                if ($i ~ /^depType=/) type = substr($i, 9)
-              }
-              next
-            }
-            name != "" && /^ARG [A-Za-z0-9_]+=/ {
-              value = $0
-              sub(/^ARG [^=]+=/, "", value)
-              sub(/@sha256:.*/, "", value)
-              print name "\t" value "\t" type
-              name = ""
-            }
-          ' Dockerfile)"
-          if [[ -z "$components" ]]; then
-            echo "::error::The Dockerfile has no '# renovate:' version pins."
-            exit 1
-          fi
-          summary="$(awk -F'\t' '$3 != "tool" { printf "%s%s %s", sep, $1, $2; sep = ", " }' <<< "$components")"
-
-          changes="$(git log --reverse --format='- %s' "$previous..HEAD" -- "${image_paths[@]}")"
-          {
-            echo "## Changes"
-            echo
-            echo "${changes:-"- Rebuild with no source changes."}"
-            echo
-            echo "## Versions"
-            echo
-            echo "| Component | Version |"
-            echo "| --- | --- |"
-            awk -F'\t' '{ print "| " $1 " | " $2 " |" }' <<< "$components"
-            echo
-            echo "## Image"
-            echo
-            echo "\`$IMAGE:$version\`"
-            for extra in $EXTRA_IMAGES; do
-              echo
-              echo "Also published as \`$extra:$version\` for deployments that use the old name."
-            done
-            echo
-            echo "The \`${version%.*}\` tag now points to this release."
-            echo
-            echo "**Full changelog**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$previous...v$version"
-          } > "$RUNNER_TEMP/notes.md"
-
+          write_notes "$previous" HEAD "$version"
           delimiter="notes-$RANDOM$RANDOM"
           {
             echo "release=true"
             echo "version=$version"
-            echo "title=v$version — $summary"
+            echo "title=$title"
             echo "notes<<$delimiter"
             cat "$RUNNER_TEMP/notes.md"
             echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
           {
-            echo "### v$version — $summary"
+            echo "### $title"
             echo
             cat "$RUNNER_TEMP/notes.md"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -298,22 +408,84 @@ jobs:
       - name: Push tags
         working-directory: ${{ runner.temp }}/digests
         env:
+          EXTRA_IMAGES: ${{ inputs.extra-images }}
           GH_TOKEN: ${{ github.token }}
           METADATA: ${{ steps.meta.outputs.json }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
-          # "Re-run failed jobs" reuses an old plan, so check the version is
-          # still free before any tag moves.
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --silent 2>/dev/null; then
+
+          # Fetches the manifest of public image $1 (name:tag) into
+          # $RUNNER_TEMP/manifest.json and sets $manifest_digest. Returns 1 when the
+          # tag doesn't exist and stops on any other answer, so a registry error is
+          # never mistaken for a missing tag.
+          fetch_manifest() {
+            local ref="${1#ghcr.io/}" token code
+            token="$(curl -fsS --retry 3 "https://ghcr.io/token?scope=repository:${ref%:*}:pull" | jq -r .token)"
+            code="$(curl -sS --retry 3 -o "$RUNNER_TEMP/manifest.json" -D "$RUNNER_TEMP/headers.txt" -w '%{http_code}' \
+              -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+              "https://ghcr.io/v2/${ref%:*}/manifests/${ref##*:}")" || true
+            case "$code" in
+              200) manifest_digest="$(tr -d '\r' < "$RUNNER_TEMP/headers.txt" | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }')" ;;
+              404) return 1 ;;
+              *) echo "::error::GHCR answered HTTP $code for $1."; exit 1 ;;
+            esac
+          }
+
+          # Points the X.Y.Z and X.Y tags of version $1, in every image name, at
+          # the index $2 (name@digest). An existing X.Y.Z never moves, and X.Y
+          # never moves back.
+          ensure_tags() {
+            local version="$1" source="$2" image tag current
+            for image in $IMAGE $EXTRA_IMAGES; do
+              for tag in "$version" "${version%.*}"; do
+                if fetch_manifest "$image:$tag"; then
+                  if [[ "$manifest_digest" == "${source##*@}" ]]; then
+                    continue
+                  fi
+                  if [[ "$tag" == "$version" ]]; then
+                    echo "::error::$image:$tag is already a different image ($manifest_digest), and X.Y.Z tags never move."
+                    exit 1
+                  fi
+                  current="$(jq -r '.annotations["org.opencontainers.image.version"] // empty' "$RUNNER_TEMP/manifest.json")"
+                  if [[ -n "$current" && "$(printf '%s\n' "$current" "$version" | sort -V | tail -n 1)" != "$version" ]]; then
+                    echo "::error::$image:$tag points to $current, which is newer than $version."
+                    exit 1
+                  fi
+                fi
+                docker buildx imagetools create -t "$image:$tag" "$source"
+              done
+            done
+          }
+
+          # "Re-run failed jobs" reuses an old plan, so stop if another run released
+          # this version since. gh prints the error body when the tag is missing.
+          if ! tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --jq .object.sha 2>/dev/null)"; then
+            tag_commit=""
+          fi
+          if [[ -n "$tag_commit" && "$tag_commit" != "$GITHUB_SHA" ]] \
+            || gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::v$VERSION already exists. Start a new run instead of re-running this one."
             exit 1
           fi
-          # X.Y.Z never moves. If a run pushed it and then failed to create the
-          # release, create that release by hand instead of publishing again.
-          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
-            echo "::error::$IMAGE:$VERSION is already published. Create the v$VERSION release by hand."
-            exit 1
+          # X.Y.Z never moves. If an earlier attempt of this run pushed it under
+          # any name and then failed, finish its other tags instead of pushing
+          # again.
+          source=""
+          for name in $IMAGE $EXTRA_IMAGES; do
+            if fetch_manifest "$name:$VERSION"; then
+              revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' "$RUNNER_TEMP/manifest.json")"
+              if [[ "$revision" != "$GITHUB_SHA" ]]; then
+                echo "::error::$name:$VERSION is already published from ${revision:-another commit}. Start a new run; it releases that image first."
+                exit 1
+              fi
+              source="$name@$manifest_digest"
+            fi
+          done
+          if [[ -n "$source" ]]; then
+            ensure_tags "$VERSION" "$source"
+            exit 0
           fi
           args=()
           while read -r tag; do args+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$METADATA")
@@ -329,8 +501,26 @@ jobs:
           TITLE: ${{ needs.plan.outputs.title }}
           NOTES: ${{ needs.plan.outputs.notes }}
         run: |
-          gh release create "v$VERSION" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "$TITLE" \
-            --notes "$NOTES"
+          set -euo pipefail
+
+          # GitHub sometimes answers 500, sometimes after creating the release, so
+          # retry and count a release that exists afterwards as created.
+          create_release() {
+            local version="$1" target="$2" title="$3" notes="$4" attempt
+            for attempt in 1 2 3 4 5; do
+              if gh release create "v$version" --repo "$GITHUB_REPOSITORY" --target "$target" --title "$title" --notes-file "$notes"; then
+                return 0
+              fi
+              if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                return 0
+              fi
+              if (( attempt < 5 )); then
+                sleep $((attempt * 15))
+              fi
+            done
+            echo "::error::Couldn't create the v$version release. The next release run creates it."
+            exit 1
+          }
+
+          printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.md"
+          create_release "$VERSION" "$GITHUB_SHA" "$TITLE" "$RUNNER_TEMP/notes.md"
