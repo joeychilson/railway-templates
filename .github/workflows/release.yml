@@ -127,8 +127,8 @@ jobs:
           # never mistaken for a missing tag.
           fetch_manifest() {
             local ref="${1#ghcr.io/}" token code
-            token="$(curl -fsS "https://ghcr.io/token?scope=repository:${ref%:*}:pull" | jq -r .token)"
-            code="$(curl -sS -o "$RUNNER_TEMP/manifest.json" -D "$RUNNER_TEMP/headers.txt" -w '%{http_code}' \
+            token="$(curl -fsS --retry 3 "https://ghcr.io/token?scope=repository:${ref%:*}:pull" | jq -r .token)"
+            code="$(curl -sS --retry 3 -o "$RUNNER_TEMP/manifest.json" -D "$RUNNER_TEMP/headers.txt" -w '%{http_code}' \
               -H "Authorization: Bearer $token" \
               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
               "https://ghcr.io/v2/${ref%:*}/manifests/${ref##*:}")" || true
@@ -140,13 +140,14 @@ jobs:
           }
 
           # Points the X.Y.Z and X.Y tags of version $1, in every image name, at
-          # index $2. An existing X.Y.Z never moves, and X.Y never moves back.
+          # the index $2 (name@digest). An existing X.Y.Z never moves, and X.Y
+          # never moves back.
           ensure_tags() {
-            local version="$1" index="$2" image tag current
+            local version="$1" source="$2" image tag current
             for image in $IMAGE $EXTRA_IMAGES; do
               for tag in "$version" "${version%.*}"; do
                 if fetch_manifest "$image:$tag"; then
-                  if [[ "$manifest_digest" == "$index" ]]; then
+                  if [[ "$manifest_digest" == "${source##*@}" ]]; then
                     continue
                   fi
                   if [[ "$tag" == "$version" ]]; then
@@ -159,7 +160,7 @@ jobs:
                     exit 1
                   fi
                 fi
-                docker buildx imagetools create -t "$image:$tag" "$IMAGE@$index"
+                docker buildx imagetools create -t "$image:$tag" "$source"
               done
             done
           }
@@ -204,22 +205,24 @@ jobs:
             # image was built from, then plan again after it.
             orphan=""
             for candidate in "$major.$minor.$((patch + 1))" "$major.$((minor + 1)).0" "$((major + 1)).0.0"; do
-              if fetch_manifest "$IMAGE:$candidate"; then
-                orphan="$candidate"
-                break
-              fi
+              for name in $IMAGE $EXTRA_IMAGES; do
+                if fetch_manifest "$name:$candidate"; then
+                  orphan="$candidate"
+                  source="$name@$manifest_digest"
+                  revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' "$RUNNER_TEMP/manifest.json")"
+                  break 2
+                fi
+              done
             done
             if [[ -n "$orphan" ]]; then
-              index="$manifest_digest"
-              revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' "$RUNNER_TEMP/manifest.json")"
               if [[ -z "$revision" ]] \
                 || ! git merge-base --is-ancestor "$previous" "$revision" 2>/dev/null \
                 || ! git merge-base --is-ancestor "$revision" HEAD 2>/dev/null; then
-                echo "::error::$IMAGE:$orphan has no release and wasn't built from a commit between $previous and HEAD. Release it by hand."
+                echo "::error::${source%@*}:$orphan has no release and wasn't built from a commit between $previous and HEAD. Release it by hand."
                 exit 1
               fi
               docker login ghcr.io -u "$GITHUB_REPOSITORY_OWNER" --password-stdin <<< "$GH_TOKEN"
-              ensure_tags "$orphan" "$index"
+              ensure_tags "$orphan" "$source"
               write_notes "$previous" "$revision" "$orphan"
               create_release "$orphan" "$revision" "$title" "$RUNNER_TEMP/notes.md"
               echo "::warning::Created the missing v$orphan release for $IMAGE:$orphan, built from $revision."
@@ -418,8 +421,8 @@ jobs:
           # never mistaken for a missing tag.
           fetch_manifest() {
             local ref="${1#ghcr.io/}" token code
-            token="$(curl -fsS "https://ghcr.io/token?scope=repository:${ref%:*}:pull" | jq -r .token)"
-            code="$(curl -sS -o "$RUNNER_TEMP/manifest.json" -D "$RUNNER_TEMP/headers.txt" -w '%{http_code}' \
+            token="$(curl -fsS --retry 3 "https://ghcr.io/token?scope=repository:${ref%:*}:pull" | jq -r .token)"
+            code="$(curl -sS --retry 3 -o "$RUNNER_TEMP/manifest.json" -D "$RUNNER_TEMP/headers.txt" -w '%{http_code}' \
               -H "Authorization: Bearer $token" \
               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
               "https://ghcr.io/v2/${ref%:*}/manifests/${ref##*:}")" || true
@@ -431,13 +434,14 @@ jobs:
           }
 
           # Points the X.Y.Z and X.Y tags of version $1, in every image name, at
-          # index $2. An existing X.Y.Z never moves, and X.Y never moves back.
+          # the index $2 (name@digest). An existing X.Y.Z never moves, and X.Y
+          # never moves back.
           ensure_tags() {
-            local version="$1" index="$2" image tag current
+            local version="$1" source="$2" image tag current
             for image in $IMAGE $EXTRA_IMAGES; do
               for tag in "$version" "${version%.*}"; do
                 if fetch_manifest "$image:$tag"; then
-                  if [[ "$manifest_digest" == "$index" ]]; then
+                  if [[ "$manifest_digest" == "${source##*@}" ]]; then
                     continue
                   fi
                   if [[ "$tag" == "$version" ]]; then
@@ -450,28 +454,37 @@ jobs:
                     exit 1
                   fi
                 fi
-                docker buildx imagetools create -t "$image:$tag" "$IMAGE@$index"
+                docker buildx imagetools create -t "$image:$tag" "$source"
               done
             done
           }
 
           # "Re-run failed jobs" reuses an old plan, so stop if another run released
-          # this version since.
-          tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --jq .object.sha 2>/dev/null || true)"
+          # this version since. gh prints the error body when the tag is missing.
+          if ! tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --jq .object.sha 2>/dev/null)"; then
+            tag_commit=""
+          fi
           if [[ -n "$tag_commit" && "$tag_commit" != "$GITHUB_SHA" ]] \
             || gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::v$VERSION already exists. Start a new run instead of re-running this one."
             exit 1
           fi
-          # X.Y.Z never moves. If an earlier attempt of this run pushed it and then
-          # failed, finish its other tags instead of pushing again.
-          if fetch_manifest "$IMAGE:$VERSION"; then
-            revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' "$RUNNER_TEMP/manifest.json")"
-            if [[ "$revision" != "$GITHUB_SHA" ]]; then
-              echo "::error::$IMAGE:$VERSION is already published from ${revision:-another commit}. Start a new run; it releases that image first."
-              exit 1
+          # X.Y.Z never moves. If an earlier attempt of this run pushed it under
+          # any name and then failed, finish its other tags instead of pushing
+          # again.
+          source=""
+          for name in $IMAGE $EXTRA_IMAGES; do
+            if fetch_manifest "$name:$VERSION"; then
+              revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' "$RUNNER_TEMP/manifest.json")"
+              if [[ "$revision" != "$GITHUB_SHA" ]]; then
+                echo "::error::$name:$VERSION is already published from ${revision:-another commit}. Start a new run; it releases that image first."
+                exit 1
+              fi
+              source="$name@$manifest_digest"
             fi
-            ensure_tags "$VERSION" "$manifest_digest"
+          done
+          if [[ -n "$source" ]]; then
+            ensure_tags "$VERSION" "$source"
             exit 0
           fi
           args=()
