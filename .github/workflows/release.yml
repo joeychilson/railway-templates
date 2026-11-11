@@ -337,20 +337,22 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}
-          # An attestation turns the push into a manifest list, whose metadata
-          # has no config digest to compare. Railway doesn't use attestations.
+          # An attestation turns the push into a manifest list, whose digest
+          # can't match the tested manifest. Railway doesn't use attestations.
           provenance: false
 
-      # The image config lists every layer's digest, so a layer rebuilt instead
-      # of reused changes it. The pushed digest is still untagged, so failing
-      # here publishes nothing.
+      # The image manifest lists the config and every layer's digest, so a
+      # layer rebuilt instead of reused changes it. Docker's containerd image
+      # store reports only this digest, not the config digest, for the loaded
+      # test image. The pushed digest is still untagged, so failing here
+      # publishes nothing.
       - name: Check the pushed image is the tested image
         env:
-          TESTED: ${{ fromJSON(steps.build.outputs.metadata)['containerimage.config.digest'] }}
-          PUSHED: ${{ fromJSON(steps.push.outputs.metadata)['containerimage.config.digest'] }}
+          TESTED: ${{ fromJSON(steps.build.outputs.metadata)['containerimage.digest'] }}
+          PUSHED: ${{ fromJSON(steps.push.outputs.metadata)['containerimage.digest'] }}
         run: |
           if [[ -z "$TESTED" || "$TESTED" != "$PUSHED" ]]; then
-            echo "::error::The pushed image config ($PUSHED) is not the one the smoke test ran ($TESTED). Run the release again."
+            echo "::error::The pushed image ($PUSHED) is not the one the smoke test ran ($TESTED). Run the release again."
             exit 1
           fi
 
