@@ -10,6 +10,7 @@ change here reaches all of them at once.
 | [SearXNG](https://railway.com/deploy/searxng-api?referralCode=NhCCIt) | [railway-searxng](https://github.com/joeychilson/railway-searxng) | `ghcr.io/joeychilson/railway-searxng` |
 | [OpenCode](https://railway.com/deploy/opencode-for-railway?referralCode=NhCCIt) | [railway-opencode](https://github.com/joeychilson/railway-opencode) | `ghcr.io/joeychilson/railway-opencode` |
 | [celld](https://railway.com/deploy/celld-for-railway?referralCode=NhCCIt) | [railway-celld](https://github.com/joeychilson/railway-celld) | `ghcr.io/joeychilson/railway-celld` |
+| [OpenOrange](https://railway.com/deploy/openorange-for-railway?referralCode=NhCCIt) | [railway-openorange](https://github.com/joeychilson/railway-openorange) | `ghcr.io/joeychilson/railway-openorange` |
 | [PostgreSQL with pgvectorscale](https://railway.com/deploy/postgresql-with-pgvectorscale?referralCode=NhCCIt) | [railway-pgvectorscale](https://github.com/joeychilson/railway-pgvectorscale) | `ghcr.io/joeychilson/railway-pgvectorscale` |
 | [PostgreSQL with pgvectorscale and pg_textsearch](https://railway.com/deploy/postgresql-with-pgvectorscale-and-pgtext?referralCode=NhCCIt) | [railway-pgvectorscale-textsearch](https://github.com/joeychilson/railway-pgvectorscale-textsearch) | `ghcr.io/joeychilson/railway-pgvectorscale-textsearch` |
 
