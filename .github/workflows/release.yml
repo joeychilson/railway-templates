@@ -127,16 +127,36 @@ jobs:
           # never mistaken for a missing tag.
           fetch_manifest() {
             local ref="${1#ghcr.io/}" token code
-            token="$(curl -fsS --retry 3 "https://ghcr.io/token?scope=repository:${ref%:*}:pull" | jq -r .token)"
-            code="$(curl -sS --retry 3 -o "$RUNNER_TEMP/manifest.json" -D "$RUNNER_TEMP/headers.txt" -w '%{http_code}' \
-              -H "Authorization: Bearer $token" \
-              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
-              "https://ghcr.io/v2/${ref%:*}/manifests/${ref##*:}")" || true
+            # GHCR refuses an anonymous token both for a package that doesn't
+            # exist yet, before a template's first release, and for a private
+            # one. Ask again with the workflow's token to tell which.
+            if ! token="$(curl -fsS --retry 3 "https://ghcr.io/token?scope=repository:${ref%:*}:pull" 2>/dev/null | jq -r .token)"; then
+              if ! token="$(curl -fsS --retry 3 -u "$GITHUB_REPOSITORY_OWNER:$GH_TOKEN" "https://ghcr.io/token?scope=repository:${ref%:*}:pull" | jq -r .token)"; then
+                echo "::error::GHCR refused a token for ${ref%:*}."
+                exit 1
+              fi
+              code="$(manifest_status "$ref" "$token")"
+              case "$code" in
+                404) return 1 ;;
+                200) echo "::error::$1 is private, and Railway pulls images without credentials. Make the package public in its package settings on GitHub, then start a new run, which finishes this release."; exit 1 ;;
+                *) echo "::error::GHCR answered HTTP $code for $1."; exit 1 ;;
+              esac
+            fi
+            code="$(manifest_status "$ref" "$token")"
             case "$code" in
               200) manifest_digest="$(tr -d '\r' < "$RUNNER_TEMP/headers.txt" | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }')" ;;
               404) return 1 ;;
               *) echo "::error::GHCR answered HTTP $code for $1."; exit 1 ;;
             esac
+          }
+
+          # Prints the HTTP status of the manifest of $1 (owner/name:tag) with
+          # registry token $2, and saves the manifest and headers.
+          manifest_status() {
+            curl -sS --retry 3 -o "$RUNNER_TEMP/manifest.json" -D "$RUNNER_TEMP/headers.txt" -w '%{http_code}' \
+              -H "Authorization: Bearer $2" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+              "https://ghcr.io/v2/${1%:*}/manifests/${1##*:}" || true
           }
 
           # Points the X.Y.Z and X.Y tags of version $1, in every image name, at
@@ -423,16 +443,36 @@ jobs:
           # never mistaken for a missing tag.
           fetch_manifest() {
             local ref="${1#ghcr.io/}" token code
-            token="$(curl -fsS --retry 3 "https://ghcr.io/token?scope=repository:${ref%:*}:pull" | jq -r .token)"
-            code="$(curl -sS --retry 3 -o "$RUNNER_TEMP/manifest.json" -D "$RUNNER_TEMP/headers.txt" -w '%{http_code}' \
-              -H "Authorization: Bearer $token" \
-              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
-              "https://ghcr.io/v2/${ref%:*}/manifests/${ref##*:}")" || true
+            # GHCR refuses an anonymous token both for a package that doesn't
+            # exist yet, before a template's first release, and for a private
+            # one. Ask again with the workflow's token to tell which.
+            if ! token="$(curl -fsS --retry 3 "https://ghcr.io/token?scope=repository:${ref%:*}:pull" 2>/dev/null | jq -r .token)"; then
+              if ! token="$(curl -fsS --retry 3 -u "$GITHUB_REPOSITORY_OWNER:$GH_TOKEN" "https://ghcr.io/token?scope=repository:${ref%:*}:pull" | jq -r .token)"; then
+                echo "::error::GHCR refused a token for ${ref%:*}."
+                exit 1
+              fi
+              code="$(manifest_status "$ref" "$token")"
+              case "$code" in
+                404) return 1 ;;
+                200) echo "::error::$1 is private, and Railway pulls images without credentials. Make the package public in its package settings on GitHub, then start a new run, which finishes this release."; exit 1 ;;
+                *) echo "::error::GHCR answered HTTP $code for $1."; exit 1 ;;
+              esac
+            fi
+            code="$(manifest_status "$ref" "$token")"
             case "$code" in
               200) manifest_digest="$(tr -d '\r' < "$RUNNER_TEMP/headers.txt" | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }')" ;;
               404) return 1 ;;
               *) echo "::error::GHCR answered HTTP $code for $1."; exit 1 ;;
             esac
+          }
+
+          # Prints the HTTP status of the manifest of $1 (owner/name:tag) with
+          # registry token $2, and saves the manifest and headers.
+          manifest_status() {
+            curl -sS --retry 3 -o "$RUNNER_TEMP/manifest.json" -D "$RUNNER_TEMP/headers.txt" -w '%{http_code}' \
+              -H "Authorization: Bearer $2" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+              "https://ghcr.io/v2/${1%:*}/manifests/${1##*:}" || true
           }
 
           # Points the X.Y.Z and X.Y tags of version $1, in every image name, at
@@ -495,6 +535,11 @@ jobs:
           for digest in *; do args+=("$IMAGE@sha256:$digest"); done
           docker buildx imagetools create "${args[@]}"
           docker buildx imagetools inspect "$IMAGE:$VERSION"
+          # A template's first release creates its package, which GHCR makes
+          # private. Stop before the release until it's public.
+          for name in $IMAGE $EXTRA_IMAGES; do
+            fetch_manifest "$name:$VERSION" || { echo "::error::$name:$VERSION is missing after the push."; exit 1; }
+          done
 
       - name: Create release
         env:
