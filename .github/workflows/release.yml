@@ -535,8 +535,8 @@ jobs:
           for digest in *; do args+=("$IMAGE@sha256:$digest"); done
           docker buildx imagetools create "${args[@]}"
           docker buildx imagetools inspect "$IMAGE:$VERSION"
-          # A template's first release creates its package, which GHCR makes
-          # private. Stop before the release until it's public.
+          # Railway pulls without credentials, so stop before the release while
+          # a package is private, as a new one might be.
           for name in $IMAGE $EXTRA_IMAGES; do
             fetch_manifest "$name:$VERSION" || { echo "::error::$name:$VERSION is missing after the push."; exit 1; }
           done
