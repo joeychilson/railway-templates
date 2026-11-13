@@ -97,10 +97,12 @@ run the Release workflow from the Actions tab and pick a bump.
 
 A new template starts from a `v0.0.0` tag on a commit without the image, such
 as the first one with only `LICENSE` and `.gitignore`. Its first release, a PR
-labelled `release:major`, publishes `1.0.0` and creates the GHCR package,
-which GitHub makes private. The release then stops before it creates the
-GitHub release: make the package public in its settings, then start a new run,
-and it finishes `1.0.0`.
+labelled `release:major`, publishes `1.0.0` and creates the GHCR package. A
+package created from a public repo's workflow has been public, as
+railway-openorange's was. Railway pulls without credentials, so a release
+whose package is private stops before it creates the GitHub release: make the
+package public in its settings, then start a new run, and it finishes the
+release.
 
 A release:
 
